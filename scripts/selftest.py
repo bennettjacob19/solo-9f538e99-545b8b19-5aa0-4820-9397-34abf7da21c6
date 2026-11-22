@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""端到端自测：一轮 OOM 与一轮强停交错并行，再验证槽位交还与正常退出。
+"""端到端自测：一轮 OOM 与一轮强停交错并行，再验证槽位交还、正常退出、
+启动中强停与退出后强停。
 
 前置：服务已在运行 ——
   * 真实 cgroup 环境：docker compose up --build
@@ -117,6 +118,42 @@ def main() -> int:
             jc = wait_finished(client, base, r.json()["job_id"], timeout=30)
             check("短作业归因 = normal_exit", jc["verdict"] == "normal_exit",
                   jc["verdict_reason"] or "")
+
+        # 6) 启动中的强停：拿到作业号立刻强停（不等 pid 出现）。
+        #    期望：接口等本轮 spawn 出结果、确认 SIGKILL 发出后才回 200；
+        #    回执时作业仍在跑（计数随后读），最终归因 force_stopped。
+        r = client.post(f"{base}/jobs", json={"memory_mib": ok_mib, "hold_seconds": 120})
+        check("启动中强停用例受理(201)", r.status_code == 201, f"got {r.status_code}")
+        if r.status_code == 201:
+            jid = r.json()["job_id"]
+            rs = client.post(f"{base}/jobs/{jid}/stop")
+            check("启动中的强停返回 200（确认已发 SIGKILL）", rs.status_code == 200,
+                  f"got {rs.status_code}: {rs.text[:120]}")
+            if rs.status_code == 200:
+                body = rs.json()
+                check("强停回执已登记 stop_requested", body["stop_requested"] is True)
+                check("回执不等计数读取（当时仍 running）", body["state"] == "running",
+                      f"state={body['state']}")
+            jd = wait_finished(client, base, jid)
+            check("启动中被强停的作业归因 = force_stopped", jd["verdict"] == "force_stopped",
+                  jd["verdict_reason"] or "")
+            check("启动中被强停的作业退出信号 = SIGKILL(9)", jd["exit_signal"] == 9,
+                  f"rc={jd['exit_status']}")
+
+        # 7) 退出后的强停：作业已出结论，强停必须 409 且不污染归因
+        r = client.post(f"{base}/jobs", json={"memory_mib": 8, "hold_seconds": 2})
+        check("退出后强停用例受理(201)", r.status_code == 201, f"got {r.status_code}")
+        if r.status_code == 201:
+            jid = r.json()["job_id"]
+            jx = wait_finished(client, base, jid, timeout=30)
+            check("用例作业先正常出结论", jx["verdict"] == "normal_exit",
+                  jx["verdict_reason"] or "")
+            rx = client.post(f"{base}/jobs/{jid}/stop")
+            check("退出后的强停被拒(409)", rx.status_code == 409, f"got {rx.status_code}")
+            jx2 = client.get(f"{base}/jobs/{jid}").json()
+            check("退出后强停不登记（stop_requested=False）", jx2["stop_requested"] is False)
+            check("退出后强停不改归因（仍 normal_exit）", jx2["verdict"] == "normal_exit",
+                  jx2["verdict_reason"] or "")
 
     failed = [n for n, ok, _ in results if not ok]
     print(f"\n== 自测完成：{len(results) - len(failed)}/{len(results)} 项通过 ==")

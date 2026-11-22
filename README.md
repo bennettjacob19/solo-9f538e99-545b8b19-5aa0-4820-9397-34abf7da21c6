@@ -5,10 +5,11 @@
 ## 原理
 
 - 每轮作业跑在**独立 slot cgroup**（`/sys/fs/cgroup/gsb/slotN`），各自设 `memory.max`。
-- 起作业前、作业回收后各读一次本轮 `memory.events` 的 `oom_kill` 计数。
-- 结合三样证据归因：**进程退出状态**、**oom_kill 前后差值**、**本轮是否登记了强停请求**。
+- 起作业前、作业回收后各读一次本轮 `memory.events` 的 **`oom_kill` 计数**。
+- 结合三样证据归因：**进程退出状态**、**oom_kill 前后差值**、**本轮是否登记了强停**
+  （仅在确认向本轮子进程发出 SIGKILL 后才登记）。
 
-| 退出状态 | oom_kill 差值 | 有强停请求 | 结论 |
+| 退出状态 | oom_kill 差值 | 已登记强停 | 结论 |
 |---|---|---|---|
 | 0 / 非零自行退出 | 0 或缺失 | 任意 | `normal_exit` |
 | 自行退出 | >0 | 任意 | `unknown`（证据冲突） |
@@ -25,6 +26,10 @@
   且能创建子 cgroup 并启用 memory 控制器，否则 `POST /jobs` 一律 503，`GET /status` 给出原因。
 - **两轮并行**：槽位数默认 2（`GSB_SLOTS`）。第三轮在槽位占满时收到 409。
 - **结论后才交还**：槽位只在归因结论（含 `unknown`）落定后交还，供下一轮使用。
+- **确认发出才回 200**：`POST /jobs/{id}/stop` 只有确认向本轮子进程发出 SIGKILL
+  才返回 200 并把本次强停登记进归因；信号发出即给回执，oom_kill 计数由后台随后读取。
+  启动中的强停会等本轮 spawn 出结果再答复（等待期间其他槽位照常接单、强停）。
+  进程已退出或启动失败时返回 **409**，本次请求不登记、归因忽略。
 
 ## 启动（docker compose）
 
@@ -38,6 +43,13 @@ docker compose up --build
 
 compose 里 `mem_limit: 384m`（等值 `memswap_limit` 禁 swap）即“内存上限生效”。
 单轮上限 = (384 − 96 预留) / 2 = **144MiB**，见 `GET /status`。
+
+无 cgroup v2 特权的环境可切换模拟后端（不碰 `/sys/fs/cgroup`，OOM 由样例作业
+按限制自查复现）：
+
+```bash
+GSB_SIMULATE=1 docker compose up --build
+```
 
 ## 用法（/docs 里点，或 curl）
 
@@ -68,14 +80,15 @@ curl -s localhost:8000/jobs/<job_id>
 
 ```bash
 # 真实 cgroup 环境（推荐）：一轮 OOM 与一轮强停交错并行 + 槽位交还 + 正常退出
+#   + 启动中强停（等确认发出才回 200）+ 退出后强停（409 不污染归因）
 docker compose run --rm selftest
 
 # 本机无特权环境：模拟后端跑通同一套流程（OOM 由样例作业按限制自查复现）
 GSB_SIMULATE=1 python3 -m uvicorn app.main:app &
 python3 scripts/selftest.py
 
-# 归因真值表单测（纯 stdlib，无依赖）
-python3 -m unittest tests.test_verdict -v
+# 归因真值表 + 强停语义单测（纯 stdlib，无依赖）
+python3 -m unittest tests.test_verdict tests.test_stop -v
 ```
 
 ## 环境变量

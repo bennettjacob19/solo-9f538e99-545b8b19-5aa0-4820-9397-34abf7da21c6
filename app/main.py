@@ -138,12 +138,17 @@ def get_job(job_id: str, request: Request):
 
 @app.post("/jobs/{job_id}/stop", tags=["诊断"])
 async def stop_job(job_id: str, request: Request):
-    """凭作业号强停（SIGKILL）。归因时会与 oom_kill 计数对照。"""
+    """凭作业号强停（SIGKILL）。归因时会与 oom_kill 计数对照。
+
+    - 200：已确认向本轮子进程发出 SIGKILL，本次强停计入归因；
+      信号发出即给回执，oom_kill 计数由后台随后读取
+    - 404：未知作业号
+    - 409：进程已退出 / 启动失败 / 已有归因结论 —— 未发信号，归因忽略本次请求
+    """
     mgr = _mgr(request)
-    job = mgr.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"未知作业号 {job_id}")
-    if job.state != "running":
-        raise HTTPException(status_code=409, detail=f"作业已结束，结论={job.verdict}")
-    await mgr.stop(job_id)
-    return job.to_dict()
+    outcome = await mgr.stop(job_id)
+    if outcome.job is None:
+        raise HTTPException(status_code=404, detail=outcome.detail)
+    if not outcome.sent:
+        raise HTTPException(status_code=409, detail=outcome.detail)
+    return outcome.job.to_dict()

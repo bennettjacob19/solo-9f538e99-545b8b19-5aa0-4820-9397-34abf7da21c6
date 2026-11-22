@@ -14,6 +14,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from .cgroups import BackendStatus, SlotHandle
 from .verdict import decide_verdict
@@ -39,8 +40,10 @@ class Job:
     pid: int | None = None
     returncode: int | None = None       # subprocess 约定：负数 = -信号
     exit_signal: int | None = None
-    stop_requested: bool = False
+    stop_requested: bool = False        # 已确认发出 SIGKILL 的强停才置位（计入归因）
     stop_requested_at: float | None = None
+    spawn_done: asyncio.Event = field(default_factory=asyncio.Event)
+    spawn_failed: bool = False
     oom_kill_before: int | None = None
     oom_kill_after: int | None = None
     oom_kill_delta: int | None = None
@@ -78,6 +81,17 @@ class NotAccepting(Exception):
 
 class NoSlotAvailable(Exception):
     """两轮槽位都在占用中。"""
+
+
+class StopOutcome(NamedTuple):
+    """一次强停请求的结果。
+
+    sent=True 表示已确认向本轮子进程发出 SIGKILL（仅此情况计入归因）。
+    """
+
+    job: "Job | None"
+    sent: bool
+    detail: str
 
 
 class JobManager:
@@ -158,15 +172,13 @@ class JobManager:
                 )
             except OSError as exc:
                 job.output_tail.append(f"spawn failed: {exc}")
+                job.spawn_failed = True
                 return
+            finally:
+                # spawn 一成一败即唤醒可能在等待的强停请求（外层 finally 再兜底一次）
+                job.spawn_done.set()
             self._procs[job.id] = proc
             job.pid = proc.pid
-            # 强停请求可能先于 spawn 到达
-            if job.stop_requested and proc.returncode is None:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
 
             async def drain() -> None:
                 assert proc.stdout is not None
@@ -183,6 +195,7 @@ class JobManager:
         except Exception as exc:  # 兜底：任何异常都不能卡住槽位
             job.output_tail.append(f"runner error: {exc!r}")
         finally:
+            job.spawn_done.set()  # 兜底：任何路径都不能让等待中的强停挂起
             self._finalize(job, handle)
 
     def _finalize(self, job: Job, handle: SlotHandle) -> None:
@@ -202,19 +215,46 @@ class JobManager:
 
     # ---------- 强停 ----------
 
-    async def stop(self, job_id: str) -> Job | None:
+    async def stop(self, job_id: str) -> StopOutcome:
+        """凭作业号强停（SIGKILL）。
+
+        只有确认向本轮子进程发出 SIGKILL 才 sent=True，且仅此情况把本次强停
+        登记进归因（stop_requested）。进程已退出或启动失败时不发信号、不登记。
+        启动中的作业先等本轮 spawn 出结果（成功/失败）再尝试发信号；等待只
+        挂起本请求，事件循环照常运转，其他槽位接单、强停不受影响。
+        """
         job = self.jobs.get(job_id)
-        if job is None or job.state != "running":
-            return job
+        if job is None:
+            return StopOutcome(None, False, f"未知作业号 {job_id}")
+        # 启动中：等本轮 spawn 有结果再决定能否发信号
+        await job.spawn_done.wait()
+        if job.state != "running":
+            return StopOutcome(
+                job, False,
+                f"作业已结束，结论={job.verdict}；未发信号，本次强停不计入归因",
+            )
+        if job.stop_requested:
+            return StopOutcome(job, True, "本轮已确认发出过 SIGKILL，回执仍然成立")
+        if job.spawn_failed:
+            return StopOutcome(
+                job, False, "作业启动失败（子进程未拉起），未发信号，本次强停不计入归因"
+            )
+        proc = self._procs.get(job_id)
+        if proc is None or proc.returncode is not None:
+            # 进程已退出（可能正在收尾读 oom_kill 计数）：发信号已无对象
+            return StopOutcome(
+                job, False, "作业进程已退出，未发信号，本次强停不计入归因"
+            )
+        try:
+            proc.kill()  # SIGKILL
+        except ProcessLookupError:
+            return StopOutcome(
+                job, False, "作业进程已退出，未发信号，本次强停不计入归因"
+            )
+        # 信号已发出：即刻给回执，oom_kill 计数由后台协程随后读取
         job.stop_requested = True
         job.stop_requested_at = time.time()
-        proc = self._procs.get(job_id)
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()  # SIGKILL
-            except ProcessLookupError:
-                pass
-        return job
+        return StopOutcome(job, True, "已向本轮子进程发出 SIGKILL，本次强停已计入归因")
 
     async def shutdown(self) -> None:
         for job in list(self.jobs.values()):
